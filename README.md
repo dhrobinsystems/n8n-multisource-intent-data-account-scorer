@@ -45,6 +45,8 @@ My answer:
 
 ## 2. Architecture
 
+![n8n Multi-Source Intent Data Account Scorer Workflow Overview](https://raw.githubusercontent.com/dhrobinsystems/n8n-multisource-intent-data-account-scorer/main/workflow-overview.png)
+
 ```mermaid
 flowchart TD
     W[Intent Signal Webhook<br/>Bombora · 6sense · G2 batches] --> V[Verify & Unwrap Intent Batch<br/>HMAC-SHA256 per source]
