@@ -1,0 +1,1631 @@
+{
+  "name": "n8n-multisource-intent-data-account-scorer",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "intent-scorer/signals",
+        "responseMode": "onReceived",
+        "options": {
+          "rawBody": true
+        }
+      },
+      "id": "a92ad934-2e55-55d5-a64d-92d1d74239e0",
+      "name": "Intent Signal Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        0,
+        200
+      ],
+      "webhookId": "00000000-0000-4000-8000-000000000151",
+      "notes": "Signed intent batches from Bombora, 6sense or G2 (or a relay). 5 pinned fictional deliveries."
+    },
+    {
+      "parameters": {
+        "rule": {
+          "interval": [
+            {
+              "field": "weeks",
+              "triggerAtDay": [
+                1
+              ],
+              "triggerAtHour": 6
+            }
+          ]
+        }
+      },
+      "id": "99debaf7-0e3b-5ab3-8296-4b24588e3885",
+      "name": "Weekly Intent Poll",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [
+        0,
+        520
+      ],
+      "notes": "Mondays 06:00 UTC: Bombora surge results, G2 buyer intent, decay rescoring."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Verify & Unwrap Intent Batch           Mode: Run Once for All Items\n// Repo: n8n-multisource-intent-data-account-scorer · dhRobin Systems\n// Envelope: { source: \"bombora\" | \"6sense\" | \"g2\", sent_at, signals: [...] }\n// Signed with X-Intent-Timestamp (unix seconds) and\n//   X-Intent-Signature: sha256=<hex HMAC-SHA256(secret, timestamp + \".\" + raw body)>\n// using INTENT_WEBHOOK_SECRET_<SOURCE> (falls back to INTENT_WEBHOOK_SECRET).\n// Constant-time compare, timestamp window outside sandbox, fails closed.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n\nconst helpers = this.helpers;\nlet crypto = null;\ntry { crypto = require('crypto'); } catch (error) { crypto = null; }\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst TOLERANCE = Math.max(60, num('SIGNATURE_TOLERANCE_SECONDS', 300));\nconst SOURCES = ['bombora', '6sense', 'g2'];\nconst MAX_SIGNALS = Math.min(20000, Math.max(1, num('MAX_SIGNALS_PER_BATCH', 5000)));\nconst secretFor = (src) => env(`INTENT_WEBHOOK_SECRET_${src.toUpperCase()}`, '') || env('INTENT_WEBHOOK_SECRET', '') || (SANDBOX_MODE ? 'sandbox-fictional-intent-signing-secret' : '');\nlet runId; try { runId = 'ias_' + crypto.randomUUID(); } catch (e) { runId = 'ias_' + Date.now().toString(36); }\nconst run = { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN, origin: 'webhook' };\nconst items = $input.all();\nconst fx = SANDBOX_MODE ? ((items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || null) : null;\nconst sha = (s) => crypto.createHash('sha256').update(String(s)).digest();\nconst safeEqual = (a, b) => !!crypto && typeof a === 'string' && typeof b === 'string' && a.length > 0 && b.length > 0 && crypto.timingSafeEqual(sha(a), sha(b));\nconst out = [];\nfor (let index = 0; index < items.length; index++) {\n  const item = items[index];\n  const h = {};\n  for (const [k, v] of Object.entries(item.json.headers || {})) h[String(k).toLowerCase()] = Array.isArray(v) ? String(v[0]) : String(v);\n  let raw = null;\n  if (item.binary && item.binary.data) { try { raw = (await helpers.getBinaryDataBuffer(index, 'data')).toString('utf8'); } catch (e) { raw = null; } }\n  let body = item.json.body;\n  if ((!body || (typeof body === 'object' && !Object.keys(body).length)) && raw) { try { body = JSON.parse(raw); } catch (e) { body = null; } }\n  if (raw === null) raw = typeof body === 'string' ? body : JSON.stringify(body ?? {});\n  if (typeof body === 'string') { try { body = JSON.parse(body); } catch (e) { body = null; } }\n  const b = body || {};\n  const base = { run, sandboxFixtures: fx, deliveryRef: `delivery-${index + 1}` };\n  const reject = (reason, source = null) => out.push({ json: { ...base, kind: 'rejected', reason, source } });\n  if (!crypto) { reject('crypto_module_unavailable'); continue; }\n  const source = String(b.source || '').toLowerCase().replace(/^sixsense$/, '6sense');\n  if (!SOURCES.includes(source)) { reject('source_not_supported'); continue; }\n  const secret = secretFor(source);\n  if (!secret) { reject('webhook_secret_not_configured', source); continue; }\n  const sigHeader = String(h['x-intent-signature'] || '').trim(); const ts = String(h['x-intent-timestamp'] || '').trim();\n  if (!sigHeader || !ts) { reject('signature_header_missing', source); continue; }\n  const sig = sigHeader.toLowerCase().startsWith('sha256=') ? sigHeader.slice(7) : sigHeader;\n  if (!safeEqual(sig.toLowerCase(), crypto.createHmac('sha256', secret).update(`${ts}.${raw}`, 'utf8').digest('hex'))) { reject('signature_mismatch', source); continue; }\n  if (!SANDBOX_MODE && (!Number.isFinite(Number(ts)) || Math.abs(Date.now() / 1000 - Number(ts)) > TOLERANCE)) { reject('timestamp_outside_tolerance', source); continue; }\n  const signals = Array.isArray(b.signals) ? b.signals : [];\n  if (!signals.length) { out.push({ json: { ...base, kind: 'ignored', reason: 'no_signals', source } }); continue; }\n  out.push({ json: { ...base, kind: 'intent_batch', source, sentAt: b.sent_at || null, signals: signals.slice(0, MAX_SIGNALS), truncated: signals.length > MAX_SIGNALS } });\n}\nreturn out;\n"
+      },
+      "id": "5175be5f-f0e4-58c1-88a8-e6b3d02b4ea9",
+      "name": "Verify & Unwrap Intent Batch",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        200
+      ],
+      "notes": "HMAC-SHA256(timestamp.body) per source · 5-minute window · fails closed."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Poll Window                      Mode: Run Once for All Items\n// Weekly pull: Bombora Company Surge results (a report you configure) and\n// G2 Buyer Intent since the last poll, plus HubSpot companies whose score\n// hasn't been refreshed for RESCORE_AFTER_DAYS (so decay is applied).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n// Scoring model: defaults below, each overridable with a one-line JSON env var.\nconst jsonEnv = (key, fallback) => { const raw = env(key, ''); if (!raw) return fallback; try { const v = JSON.parse(raw); return v && typeof v === 'object' ? v : fallback; } catch (e) { return fallback; } };\nconst IP = env('INTENT_PROPERTY_PREFIX', 'intent_');\nconst P = {\n  bomboraScore: `${IP}bombora_score`, bomboraDate: `${IP}bombora_date`, bomboraTopics: `${IP}bombora_topics`,\n  sixScore: `${IP}6sense_score`, sixStage: `${IP}6sense_stage`, sixDate: `${IP}6sense_date`,\n  g2Score: `${IP}g2_score`, g2Date: `${IP}g2_date`, g2Activity: `${IP}g2_activity`, g2Competitor: `${IP}g2_competitor_research`,\n  intent: `${IP}score`, fit: `${IP}fit_score`, account: `${IP}account_score`, tier: `${IP}tier`, trend: `${IP}trend`, sources: `${IP}sources_active`,\n  top: `${IP}top_signal`, review: `${IP}review_required`, reason: `${IP}review_reason`, scored: `${IP}last_scored`, history: `${IP}score_history`,\n};\nconst SOURCE_KEYS = { bombora: ['bomboraScore', 'bomboraDate'], '6sense': ['sixScore', 'sixDate'], g2: ['g2Score', 'g2Date'] };\nconst SOURCE_TRUST = jsonEnv('INTENT_SOURCE_WEIGHTS_JSON', { bombora: 0.85, '6sense': 1.0, g2: 0.9 });\nconst STAGE_SCORE = { target: 10, awareness: 30, consideration: 55, decision: 80, purchase: 95 };\nconst G2_VISIT_WEIGHTS = jsonEnv('G2_VISIT_WEIGHTS_JSON', { 'competitive/pricing': 1.0, pricing: 1.0, compare: 0.9, 'competitive/compare': 0.9, competitors: 0.85, alternatives: 0.85,\n  'competitive/profile': 0.7, profile: 0.6, product_reference_page: 0.5, reviewers: 0.5, category: 0.4, vendors: 0.4, licensed_content: 0.3, ad: 0.3 });\nconst ICP = jsonEnv('ICP_RULES_JSON', {\n  industries: { points: 35, values: ['COMPUTER_SOFTWARE', 'FINANCIAL_SERVICES', 'LOGISTICS_AND_SUPPLY_CHAIN', 'INFORMATION_TECHNOLOGY_AND_SERVICES'] },\n  employees: { points: 30, min: 200, max: 5000 }, countries: { points: 20, values: ['United States', 'Canada', 'United Kingdom', 'Germany'] },\n  revenue: { points: 15, min: 20000000, max: 1000000000 },\n});\nconst FREE_MAIL = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com']);\nconst cleanDomain = (d) => { let s = String(d || '').trim().toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split(/[\\/?#:]/)[0]; return /^[a-z0-9.-]+\\.[a-z]{2,}$/.test(s) ? s : ''; };\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\nconst first = $input.first().json || {};\nconst fx = SANDBOX_MODE ? (first.sandboxFixtures || null) : null;\nconst state = (!SANDBOX_MODE && $getWorkflowStaticData('global').intentPollState) || {};\nconst now = fx && fx.now ? new Date(fx.now) : new Date();\nconst from = state.lastPollTo ? new Date(Math.max(Date.parse(state.lastPollTo), now.getTime() - 30 * 86400000)) : new Date(now.getTime() - Math.max(1, num('POLL_LOOKBACK_DAYS', 7)) * 86400000);\nconst day = (d) => d.toISOString().slice(0, 10);\nconst rescoreBefore = new Date(now.getTime() - Math.max(1, num('RESCORE_AFTER_DAYS', 6)) * 86400000);\nlet runId; try { runId = 'ias_' + require('crypto').randomUUID(); } catch (e) { runId = 'ias_' + Date.now().toString(36); }\nreturn [{ json: { kind: 'poll_window', sandboxFixtures: fx,\n  run: { runId, startedAt: new Date().toISOString(), mode: SANDBOX_MODE ? 'sandbox' : DRY_RUN ? 'dry_run' : 'live', sandboxMode: SANDBOX_MODE, dryRun: DRY_RUN, origin: 'poll' },\n  poll: { from: from.toISOString(), to: now.toISOString(), pollBombora: flag('POLL_BOMBORA', true) && !!env('BOMBORA_SURGE_RESULTS_URL', SANDBOX_MODE ? 'sandbox' : ''),\n    pollG2: flag('POLL_G2', true), g2Query: `start_date=${day(from)}&end_date=${day(now)}&page[size]=${Math.min(100, Math.max(1, num('G2_PAGE_SIZE', 100)))}`,\n    rescoreBody: { filterGroups: [{ filters: [{ propertyName: P.scored, operator: 'LT', value: String(rescoreBefore.getTime()) }, { propertyName: P.account, operator: 'GT', value: '0' }] }],\n      properties: ['domain'], limit: 100 } } } }];\n"
+      },
+      "id": "703abd7f-45dd-5492-9e22-351419f2dc4b",
+      "name": "Build Poll Window",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "09cd0f13-87bd-54f3-a4d8-e1c238cdb506",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "efee4d54-1b01-5c3f-84f5-86ee574f14f7",
+      "name": "Sandbox Poll?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Load Poll Fixtures (Sandbox)           Mode: Run Once for All Items\n// ─────────────────────────────────────────────────────────────────────\nconst first = $input.first().json;\nconst p = (first.sandboxFixtures || {}).poll || {};\nreturn [{ json: { ...first, simulatedPoll: { bombora: { statusCode: 200, body: p.bombora || [] }, g2: { statusCode: 200, body: p.g2 || { data: [] } }, rescore: { statusCode: 200, body: p.rescore || { results: [] } } } } }];\n"
+      },
+      "id": "17fa7446-bb0d-530d-ac0e-30a1d46e941d",
+      "name": "Load Poll Fixtures (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        720,
+        440
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "01afb5db-12ac-5b41-a154-12e141b0f1fd",
+              "leftValue": "={{ $json.poll.pollBombora }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "fe497361-6a53-5f76-979e-64d3c3f79731",
+      "name": "Poll Bombora?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        720,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.BOMBORA_SURGE_RESULTS_URL }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "={{ $env.BOMBORA_AUTH_HEADER_NAME || 'Authorization' }}",
+              "value": "={{ (($env.BOMBORA_AUTH_SCHEME ?? 'Bearer') ? ($env.BOMBORA_AUTH_SCHEME ?? 'Bearer') + ' ' : '') + ($env.BOMBORA_API_KEY || '') }}"
+            }
+          ]
+        }
+      },
+      "id": "8304ad10-60e2-538a-9fd6-5ee4bcf06f14",
+      "name": "Fetch Bombora Surge",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        960,
+        560
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true,
+      "notes": "Company Surge report results (JSON) · URL and auth header from env."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "4bc375c7-a849-5d6d-894c-59508ef87a6f",
+              "leftValue": "={{ $('Build Poll Window').first().json.poll.pollG2 }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "86e44763-1491-5b02-b11c-e82e060f8b35",
+      "name": "Poll G2?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1200,
+        600
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.G2_API_BASE_URL || 'https://data.g2.com').replace(/\\/+$/, '') }}/api/v2/buyer_intent?{{ $('Build Poll Window').first().json.poll.g2Query }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        },
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Token token={{ $env.G2_API_TOKEN }}"
+            }
+          ]
+        }
+      },
+      "id": "f86022d8-be59-58d9-b389-6815fbae21a7",
+      "name": "Fetch G2 Buyer Intent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1440,
+        560
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true,
+      "notes": "GET /api/v2/buyer_intent for the window."
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com').replace(/\\/+$/, '') }}/crm/v3/objects/companies/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($('Build Poll Window').first().json.poll.rescoreBody) }}"
+      },
+      "id": "36b67e52-ad34-5f53-b039-ff116bcbf036",
+      "name": "Find Companies to Rescore",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        1680,
+        600
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "executeOnce": true,
+      "notes": "Scored companies not refreshed for RESCORE_AFTER_DAYS → decay applied."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Package Poll Results                   Mode: Run Once for All Items\n// Wraps each provider response as an intent_batch (same shape as the\n// webhook) and adds rescore-only accounts. Advances the cursor in live mode\n// when every enabled call succeeded.\n// ─────────────────────────────────────────────────────────────────────\nconst win = $('Build Poll Window').first().json;\nconst sim = ($input.first().json || {}).simulatedPoll || null;\nconst grab = (n) => { try { return $(n).first().json; } catch (e) { return null; } };\nconst bombora = sim ? sim.bombora : (win.poll.pollBombora ? grab('Fetch Bombora Surge') : null);\nconst g2 = sim ? sim.g2 : (win.poll.pollG2 ? grab('Fetch G2 Buyer Intent') : null);\nconst rescore = sim ? sim.rescore : grab('Find Companies to Rescore');\nconst ok = (r) => r && !r.error && Number(r.statusCode) >= 200 && Number(r.statusCode) < 300;\nconst base = { run: win.run, sandboxFixtures: win.sandboxFixtures, deliveryRef: 'poll' };\nconst out = []; const problems = [];\nif (win.poll.pollBombora) {\n  if (!ok(bombora)) problems.push('bombora_poll_failed');\n  else { const b = bombora.body; const rows = Array.isArray(b) ? b : (b && (b.results || b.data || b.Results)) || []; if (rows.length) out.push({ json: { ...base, kind: 'intent_batch', source: 'bombora', signals: rows } }); }\n}\nif (win.poll.pollG2) {\n  if (!ok(g2)) problems.push('g2_poll_failed');\n  else { const rows = ((g2.body || {}).data || []).map((r) => (r && r.attributes ? { id: r.id, ...r.attributes } : r)); if (rows.length) out.push({ json: { ...base, kind: 'intent_batch', source: 'g2', signals: rows } }); }\n}\nif (ok(rescore)) { const domains = (((rescore.body || {}).results) || []).map((c) => (c.properties || {}).domain).filter(Boolean); if (domains.length) out.push({ json: { ...base, kind: 'rescore_batch', domains } }); }\nelse problems.push('rescore_search_failed');\nfor (const p of problems) out.push({ json: { ...base, kind: 'poll_error', reason: p } });\nif (!win.run.sandboxMode && !win.run.dryRun && !problems.length) $getWorkflowStaticData('global').intentPollState = { lastPollTo: win.poll.to, at: new Date().toISOString() };\nreturn out.length ? out : [{ json: { ...base, kind: 'poll_empty', reason: 'no_signals_in_window' } }];\n"
+      },
+      "id": "1effce96-5b91-5b91-837b-f06a84a75bdc",
+      "name": "Package Poll Results",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        1920,
+        520
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Intent Normalizer & Weighting Engine   Mode: Run Once for All Items\n// Converts provider-native records into one 0–100 score per source and\n// account (domain), before decay:\n//   Bombora  composite score per topic; only topics ≥ BOMBORA_SURGE_THRESHOLD\n//            (60) count; best (score × topic weight) + breadth bonus of 4 per\n//            extra surging topic with weight ≥ 0.5 (max +12).\n//   6sense   0.6 × intent score + 0.4 × buying-stage score\n//            (Target 10 · Awareness 30 · Consideration 55 · Decision 80 ·\n//            Purchase 95).\n//   G2       Σ of the 4 strongest visits: 30 × visit-type weight ×\n//            (1 + ln(visits)); pricing / compare / competitor views weigh most.\n// Person-level fields are never read. Free-mail and invalid domains are\n// dropped. Emits one account item per domain with its source updates.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n// Scoring model: defaults below, each overridable with a one-line JSON env var.\nconst jsonEnv = (key, fallback) => { const raw = env(key, ''); if (!raw) return fallback; try { const v = JSON.parse(raw); return v && typeof v === 'object' ? v : fallback; } catch (e) { return fallback; } };\nconst IP = env('INTENT_PROPERTY_PREFIX', 'intent_');\nconst P = {\n  bomboraScore: `${IP}bombora_score`, bomboraDate: `${IP}bombora_date`, bomboraTopics: `${IP}bombora_topics`,\n  sixScore: `${IP}6sense_score`, sixStage: `${IP}6sense_stage`, sixDate: `${IP}6sense_date`,\n  g2Score: `${IP}g2_score`, g2Date: `${IP}g2_date`, g2Activity: `${IP}g2_activity`, g2Competitor: `${IP}g2_competitor_research`,\n  intent: `${IP}score`, fit: `${IP}fit_score`, account: `${IP}account_score`, tier: `${IP}tier`, trend: `${IP}trend`, sources: `${IP}sources_active`,\n  top: `${IP}top_signal`, review: `${IP}review_required`, reason: `${IP}review_reason`, scored: `${IP}last_scored`, history: `${IP}score_history`,\n};\nconst SOURCE_KEYS = { bombora: ['bomboraScore', 'bomboraDate'], '6sense': ['sixScore', 'sixDate'], g2: ['g2Score', 'g2Date'] };\nconst SOURCE_TRUST = jsonEnv('INTENT_SOURCE_WEIGHTS_JSON', { bombora: 0.85, '6sense': 1.0, g2: 0.9 });\nconst STAGE_SCORE = { target: 10, awareness: 30, consideration: 55, decision: 80, purchase: 95 };\nconst G2_VISIT_WEIGHTS = jsonEnv('G2_VISIT_WEIGHTS_JSON', { 'competitive/pricing': 1.0, pricing: 1.0, compare: 0.9, 'competitive/compare': 0.9, competitors: 0.85, alternatives: 0.85,\n  'competitive/profile': 0.7, profile: 0.6, product_reference_page: 0.5, reviewers: 0.5, category: 0.4, vendors: 0.4, licensed_content: 0.3, ad: 0.3 });\nconst ICP = jsonEnv('ICP_RULES_JSON', {\n  industries: { points: 35, values: ['COMPUTER_SOFTWARE', 'FINANCIAL_SERVICES', 'LOGISTICS_AND_SUPPLY_CHAIN', 'INFORMATION_TECHNOLOGY_AND_SERVICES'] },\n  employees: { points: 30, min: 200, max: 5000 }, countries: { points: 20, values: ['United States', 'Canada', 'United Kingdom', 'Germany'] },\n  revenue: { points: 15, min: 20000000, max: 1000000000 },\n});\nconst FREE_MAIL = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com']);\nconst cleanDomain = (d) => { let s = String(d || '').trim().toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split(/[\\/?#:]/)[0]; return /^[a-z0-9.-]+\\.[a-z]{2,}$/.test(s) ? s : ''; };\n\nconst items = $input.all();\nconst first = (items[0] || { json: {} }).json;\nconst fx = first.run && first.run.sandboxMode ? ((items.find((i) => i.json.sandboxFixtures) || { json: {} }).json.sandboxFixtures || {}) : {};\nconst cfg = fx.config || {};\nconst TOPIC_WEIGHTS = jsonEnv('TOPIC_WEIGHTS_JSON', cfg.topicWeights || {});\nconst DEFAULT_TOPIC_WEIGHT = Math.min(1, Math.max(0, num('DEFAULT_TOPIC_WEIGHT', 0.3)));\nconst SURGE = Math.min(100, Math.max(0, num('BOMBORA_SURGE_THRESHOLD', 60)));\nconst now = fx.now ? new Date(fx.now) : new Date();\nconst dayOf = (v) => { const t = Date.parse(v); return Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : null; };\nconst topicWeight = (name) => { const k = Object.keys(TOPIC_WEIGHTS).find((t) => t.toLowerCase() === String(name || '').toLowerCase()); return k ? Number(TOPIC_WEIGHTS[k]) : DEFAULT_TOPIC_WEIGHT; };\nconst accounts = new Map(); const out = []; const dropped = {};\nconst drop = (src, reason) => { const k = `${src}:${reason}`; dropped[k] = (dropped[k] || 0) + 1; };\nconst acct = (domain, j) => { if (!accounts.has(domain)) accounts.set(domain, { run: j.run, sandboxFixtures: j.sandboxFixtures || null, kind: 'account_signals', domain, origin: j.run.origin, raw: {}, updates: {}, rescoreOnly: true }); return accounts.get(domain); };\n\nfor (const item of items) {\n  const j = item.json;\n  if (j.kind === 'rescore_batch') { for (const d of j.domains) { const dom = cleanDomain(d); if (dom) acct(dom, j); } continue; }\n  if (j.kind !== 'intent_batch') { out.push(item); continue; }\n  for (const s of j.signals) {\n    const domain = cleanDomain(s.domain || s.company_domain || s.Domain || s.website || s.company_website);\n    if (!domain) { drop(j.source, 'invalid_domain'); continue; }\n    if (FREE_MAIL.has(domain)) { drop(j.source, 'free_mail_domain'); continue; }\n    const a = acct(domain, j); a.rescoreOnly = false;\n    (a.raw[j.source] = a.raw[j.source] || []).push(s);\n  }\n}\nfor (const a of accounts.values()) {\n  const b = a.raw.bombora;\n  if (b) {\n    const topics = b.map((r) => ({ name: String(r.topic_name || r.TopicName || r.topic || 'unknown'), score: Number(r.composite_score ?? r.CompositeScore ?? r.score) || 0,\n      delta: Number(r.composite_score_delta ?? r.CompositeScoreDelta ?? 0) || 0, date: dayOf(r.week || r.date || r.week_start) }))\n      .map((t) => ({ ...t, weight: topicWeight(t.name), surging: t.score >= SURGE }));\n    const surging = topics.filter((t) => t.surging).sort((x, y) => y.score * y.weight - x.score * x.weight);\n    const best = surging.length ? surging[0].score * surging[0].weight : 0;\n    const breadth = Math.min(12, 4 * Math.max(0, surging.filter((t) => t.weight >= 0.5).length - 1));\n    const date = topics.map((t) => t.date).filter(Boolean).sort().pop() || now.toISOString().slice(0, 10);\n    a.updates.bombora = { score: Math.min(100, Math.round(best + (best ? breadth : 0))), date, surgingTopics: surging.length,\n      topics: surging.slice(0, 5).map((t) => `${t.name} (${t.score})`), top: surging[0] ? `Bombora surge on ${surging[0].name} (${surging[0].score})` : null };\n  }\n  const six = a.raw['6sense'];\n  if (six) {\n    const r = six.slice().sort((x, y) => String(y.updated_at || '').localeCompare(String(x.updated_at || '')))[0];\n    const stage = String(r.buying_stage || r.buyingStage || '').toLowerCase();\n    const intent = Math.min(100, Math.max(0, Number(r.intent_score ?? r.intentScore) || 0));\n    const score = Math.round(0.6 * intent + 0.4 * (STAGE_SCORE[stage] ?? 0));\n    a.updates['6sense'] = { score, date: dayOf(r.updated_at || r.date) || now.toISOString().slice(0, 10), stage: stage ? stage[0].toUpperCase() + stage.slice(1) : '',\n      profileFit: r.profile_fit || r.profileFit || '', keywords: (r.keywords || r.intent_keywords || []).slice(0, 5),\n      top: `6sense ${stage ? stage[0].toUpperCase() + stage.slice(1) : 'intent'} stage (intent ${intent})` };\n  }\n  const g2 = a.raw.g2;\n  if (g2) {\n    const visits = g2.map((r) => { const type = String(r.visit_type || r.signal_type || 'profile').toLowerCase(); const n = Math.max(1, Number(r.visits || r.visit_count || 1));\n      return { type, n, date: dayOf(r.visit_date || r.date), w: G2_VISIT_WEIGHTS[type] ?? 0.3, product: r.product_name || '' }; })\n      .map((v) => ({ ...v, points: 30 * v.w * (1 + Math.log(v.n)) })).sort((x, y) => y.points - x.points);\n    const score = Math.min(100, Math.round(visits.slice(0, 4).reduce((s, v) => s + v.points, 0)));\n    const competitor = visits.some((v) => /^competitive\\/|^competitors$|^alternatives$/.test(v.type));\n    a.updates.g2 = { score, date: visits.map((v) => v.date).filter(Boolean).sort().pop() || now.toISOString().slice(0, 10), competitor,\n      activity: visits.slice(0, 4).map((v) => `${v.type} ×${v.n}`), top: visits[0] ? `G2 ${visits[0].type.replace('/', ' ')} activity (${visits[0].n} visits)` : null };\n  }\n  const { raw, ...rest } = a;\n  out.push({ json: rest });\n}\nif (Object.keys(dropped).length) out.push({ json: { run: first.run, kind: 'signals_dropped', reason: 'filtered', stats: dropped } });\nreturn out;\n"
+      },
+      "id": "9068d3db-699b-5b55-9b74-d0753ab0f32d",
+      "name": "Intent Normalizer & Weighting Engine",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2160,
+        300
+      ],
+      "notes": "Per-source 0–100 scores · topic and visit-type weights · one item per domain."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "325e4237-a8f9-54cb-bac2-0018cbba9ab8",
+              "leftValue": "={{ $json.kind }}",
+              "rightValue": "account_signals",
+              "operator": {
+                "type": "string",
+                "operation": "equals"
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "b10d4ec8-315b-54ad-9326-8fbc2a91eebc",
+      "name": "Is Account?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2400,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Build Company Lookup                   Mode: Run Once for Each Item\n// HubSpot company by domain (with and without www.), with the ICP fit\n// properties and every stored intent property.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n// Scoring model: defaults below, each overridable with a one-line JSON env var.\nconst jsonEnv = (key, fallback) => { const raw = env(key, ''); if (!raw) return fallback; try { const v = JSON.parse(raw); return v && typeof v === 'object' ? v : fallback; } catch (e) { return fallback; } };\nconst IP = env('INTENT_PROPERTY_PREFIX', 'intent_');\nconst P = {\n  bomboraScore: `${IP}bombora_score`, bomboraDate: `${IP}bombora_date`, bomboraTopics: `${IP}bombora_topics`,\n  sixScore: `${IP}6sense_score`, sixStage: `${IP}6sense_stage`, sixDate: `${IP}6sense_date`,\n  g2Score: `${IP}g2_score`, g2Date: `${IP}g2_date`, g2Activity: `${IP}g2_activity`, g2Competitor: `${IP}g2_competitor_research`,\n  intent: `${IP}score`, fit: `${IP}fit_score`, account: `${IP}account_score`, tier: `${IP}tier`, trend: `${IP}trend`, sources: `${IP}sources_active`,\n  top: `${IP}top_signal`, review: `${IP}review_required`, reason: `${IP}review_reason`, scored: `${IP}last_scored`, history: `${IP}score_history`,\n};\nconst SOURCE_KEYS = { bombora: ['bomboraScore', 'bomboraDate'], '6sense': ['sixScore', 'sixDate'], g2: ['g2Score', 'g2Date'] };\nconst SOURCE_TRUST = jsonEnv('INTENT_SOURCE_WEIGHTS_JSON', { bombora: 0.85, '6sense': 1.0, g2: 0.9 });\nconst STAGE_SCORE = { target: 10, awareness: 30, consideration: 55, decision: 80, purchase: 95 };\nconst G2_VISIT_WEIGHTS = jsonEnv('G2_VISIT_WEIGHTS_JSON', { 'competitive/pricing': 1.0, pricing: 1.0, compare: 0.9, 'competitive/compare': 0.9, competitors: 0.85, alternatives: 0.85,\n  'competitive/profile': 0.7, profile: 0.6, product_reference_page: 0.5, reviewers: 0.5, category: 0.4, vendors: 0.4, licensed_content: 0.3, ad: 0.3 });\nconst ICP = jsonEnv('ICP_RULES_JSON', {\n  industries: { points: 35, values: ['COMPUTER_SOFTWARE', 'FINANCIAL_SERVICES', 'LOGISTICS_AND_SUPPLY_CHAIN', 'INFORMATION_TECHNOLOGY_AND_SERVICES'] },\n  employees: { points: 30, min: 200, max: 5000 }, countries: { points: 20, values: ['United States', 'Canada', 'United Kingdom', 'Germany'] },\n  revenue: { points: 15, min: 20000000, max: 1000000000 },\n});\nconst FREE_MAIL = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com']);\nconst cleanDomain = (d) => { let s = String(d || '').trim().toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split(/[\\/?#:]/)[0]; return /^[a-z0-9.-]+\\.[a-z]{2,}$/.test(s) ? s : ''; };\n\nconst FIT_PROPS = ['industry', 'numberofemployees', 'country', 'annualrevenue', ...csv('ICP_EXTRA_PROPERTIES', '')];\nreturn { json: { ...$json, lookup: { body: { filterGroups: [{ filters: [{ propertyName: 'domain', operator: 'EQ', value: $json.domain }] }, { filters: [{ propertyName: 'domain', operator: 'EQ', value: `www.${$json.domain}` }] }],\n  properties: ['name', 'domain', 'hs_lastmodifieddate', ...FIT_PROPS, ...Object.values(P)], limit: 3 } } } };\n"
+      },
+      "id": "9111952b-0acb-526f-95ae-6593712548da",
+      "name": "Build Company Lookup",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        2640,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "64faec8e-d2bc-5740-bea7-2774dbbddea5",
+              "leftValue": "={{ $json.run.sandboxMode }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "570b3e84-cec1-5778-93e3-6965933c3a35",
+      "name": "Sandbox HubSpot?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        2880,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Company Lookup (Sandbox)      Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nconst results = ((($json.sandboxFixtures || {}).companies) || []).filter((c) => String(c.properties.domain || '').replace(/^www\\./, '') === $json.domain);\nreturn { json: { ...$json, simulatedLookup: { statusCode: 200, body: { total: results.length, results } } } };\n"
+      },
+      "id": "bb75e8d4-5784-54c2-84f4-37148816c7a3",
+      "name": "Simulate Company Lookup (Sandbox)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3120,
+        120
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com').replace(/\\/+$/, '') }}/crm/v3/objects/companies/search",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 4,
+              "batchInterval": 1100
+            }
+          }
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.lookup.body) }}"
+      },
+      "id": "d7a27990-e3a7-5012-883e-8533619bc2a2",
+      "name": "Search Company by Domain",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        3120,
+        320
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "notes": "domain EQ … OR www.…"
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Compute Account Intent Score           Mode: Run Once for Each Item\n// 1. Merges the new source scores with the ones already on the company\n//    (an update older than the stored date for that source is ignored).\n// 2. Decays every source by age: score × 0.5^(age ÷ INTENT_HALF_LIFE_DAYS);\n//    sources older than MAX_SIGNAL_AGE_DAYS count as inactive.\n// 3. Intent (0–100) = 0.6 × strongest trusted source + 0.4 × trust-weighted\n//    mean of active sources, + 5 per extra corroborating source ≥ 40 (max +10).\n// 4. ICP fit (0–100) from industry, employees, country and revenue\n//    (ICP_RULES_JSON); a missing value earns half the points and is flagged.\n// 5. Account score = INTENT_WEIGHT × intent + FIT_WEIGHT × fit; tier hot /\n//    warm / monitor / cold, or non_icp when fit is below NON_ICP_FIT_MAX.\n// 6. Moving up into hot or warm sets review_required with a reason.\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\n// Scoring model: defaults below, each overridable with a one-line JSON env var.\nconst jsonEnv = (key, fallback) => { const raw = env(key, ''); if (!raw) return fallback; try { const v = JSON.parse(raw); return v && typeof v === 'object' ? v : fallback; } catch (e) { return fallback; } };\nconst IP = env('INTENT_PROPERTY_PREFIX', 'intent_');\nconst P = {\n  bomboraScore: `${IP}bombora_score`, bomboraDate: `${IP}bombora_date`, bomboraTopics: `${IP}bombora_topics`,\n  sixScore: `${IP}6sense_score`, sixStage: `${IP}6sense_stage`, sixDate: `${IP}6sense_date`,\n  g2Score: `${IP}g2_score`, g2Date: `${IP}g2_date`, g2Activity: `${IP}g2_activity`, g2Competitor: `${IP}g2_competitor_research`,\n  intent: `${IP}score`, fit: `${IP}fit_score`, account: `${IP}account_score`, tier: `${IP}tier`, trend: `${IP}trend`, sources: `${IP}sources_active`,\n  top: `${IP}top_signal`, review: `${IP}review_required`, reason: `${IP}review_reason`, scored: `${IP}last_scored`, history: `${IP}score_history`,\n};\nconst SOURCE_KEYS = { bombora: ['bomboraScore', 'bomboraDate'], '6sense': ['sixScore', 'sixDate'], g2: ['g2Score', 'g2Date'] };\nconst SOURCE_TRUST = jsonEnv('INTENT_SOURCE_WEIGHTS_JSON', { bombora: 0.85, '6sense': 1.0, g2: 0.9 });\nconst STAGE_SCORE = { target: 10, awareness: 30, consideration: 55, decision: 80, purchase: 95 };\nconst G2_VISIT_WEIGHTS = jsonEnv('G2_VISIT_WEIGHTS_JSON', { 'competitive/pricing': 1.0, pricing: 1.0, compare: 0.9, 'competitive/compare': 0.9, competitors: 0.85, alternatives: 0.85,\n  'competitive/profile': 0.7, profile: 0.6, product_reference_page: 0.5, reviewers: 0.5, category: 0.4, vendors: 0.4, licensed_content: 0.3, ad: 0.3 });\nconst ICP = jsonEnv('ICP_RULES_JSON', {\n  industries: { points: 35, values: ['COMPUTER_SOFTWARE', 'FINANCIAL_SERVICES', 'LOGISTICS_AND_SUPPLY_CHAIN', 'INFORMATION_TECHNOLOGY_AND_SERVICES'] },\n  employees: { points: 30, min: 200, max: 5000 }, countries: { points: 20, values: ['United States', 'Canada', 'United Kingdom', 'Germany'] },\n  revenue: { points: 15, min: 20000000, max: 1000000000 },\n});\nconst FREE_MAIL = new Set(['gmail.com', 'googlemail.com', 'outlook.com', 'hotmail.com', 'live.com', 'yahoo.com', 'icloud.com', 'me.com', 'aol.com', 'proton.me', 'protonmail.com', 'gmx.com']);\nconst cleanDomain = (d) => { let s = String(d || '').trim().toLowerCase().replace(/^https?:\\/\\//, '').replace(/^www\\./, '').split(/[\\/?#:]/)[0]; return /^[a-z0-9.-]+\\.[a-z]{2,}$/.test(s) ? s : ''; };\n\nlet ctx; let resp;\nif ($json.simulatedLookup) { ctx = $json; resp = $json.simulatedLookup; } else { ctx = $('Build Company Lookup').item.json; resp = $json; }\nconst { simulatedLookup, lookup, ...rest } = ctx;\nconst fx = rest.sandboxFixtures || {};\nconst now = fx.now ? new Date(fx.now) : new Date();\nconst today = now.toISOString().slice(0, 10);\nconst HALF = Math.max(1, num('INTENT_HALF_LIFE_DAYS', 14));\nconst MAX_AGE = Math.max(HALF, num('MAX_SIGNAL_AGE_DAYS', 45));\nconst IW = Math.min(1, Math.max(0, num('INTENT_WEIGHT', 0.6)));\nconst FW = 1 - IW;\nconst HOT = num('HOT_SCORE_MIN', 75); const WARM = num('WARM_SCORE_MIN', 55); const MONITOR = num('MONITOR_SCORE_MIN', 35);\nconst HOT_INTENT = num('HOT_INTENT_MIN', 60); const HOT_FIT = num('HOT_FIT_MIN', 50); const NON_ICP = num('NON_ICP_FIT_MAX', 35);\nconst HISTORY = Math.min(52, Math.max(4, num('SCORE_HISTORY_SIZE', 12)));\nconst plan = (p, extra = {}) => ({ json: { ...rest, kind: 'account_plan', plan: { write: false, holds: [], ...p }, ...extra } });\nconst status = Number(resp.statusCode || 0);\nif (resp.error || status !== 200) return plan({ action: 'lookup_failed', reason: [401, 403].includes(status) ? 'hubspot_auth_or_scope_error' : 'company_search_failed', httpStatus: status || null });\nconst results = ((resp.body || {}).results) || [];\nif (!results.length) return plan({ action: 'company_not_found', reason: 'no_hubspot_company_for_domain' });\nconst holds = results.length > 1 ? ['duplicate_companies_for_domain'] : [];\nconst co = results.slice().sort((a, b) => Number(a.id) - Number(b.id))[0];\nconst pr = co.properties || {};\nconst numOr = (v) => { const n = Number(v); return v === null || v === undefined || v === '' || !Number.isFinite(n) ? null : n; };\n\n// 1. merge stored + new source snapshots\nconst stored = {};\nfor (const [src, [sk, dk]] of Object.entries(SOURCE_KEYS)) { const s = numOr(pr[P[sk]]); const d = pr[P[dk]] || null; if (s !== null && d) stored[src] = { score: s, date: String(d).slice(0, 10) }; }\nconst merged = { ...stored }; const applied = []; const stale = [];\nfor (const [src, u] of Object.entries(rest.updates || {})) {\n  if (stored[src] && u.date < stored[src].date) { stale.push(src); continue; }\n  merged[src] = { ...u }; applied.push(src);\n}\nif (stale.length) holds.push(...stale.map((s) => `${s}_update_older_than_stored`));\n// 2. decay\nconst ageDays = (d) => Math.max(0, (now.getTime() - Date.parse(`${d}T00:00:00Z`)) / 86400000);\nconst eff = {};\nfor (const [src, s] of Object.entries(merged)) { const age = ageDays(s.date); eff[src] = age > MAX_AGE ? 0 : Math.round(s.score * Math.pow(0.5, age / HALF) * 10) / 10; }\n// 3. intent\nconst active = Object.entries(eff).filter(([, v]) => v > 0);\nconst trust = (s) => Number(SOURCE_TRUST[s] ?? 0.8);\nlet intent = 0;\nif (active.length) {\n  const strongest = Math.max(...active.map(([s, v]) => v * trust(s)));\n  const mean = active.reduce((a, [s, v]) => a + v * trust(s), 0) / active.reduce((a, [s]) => a + trust(s), 0);\n  const corroborating = active.filter(([, v]) => v >= 40).length;\n  intent = Math.min(100, Math.round(0.6 * strongest + 0.4 * mean + Math.min(10, 5 * Math.max(0, corroborating - 1))));\n}\n// 4. fit\nconst fitFlags = []; let fitPoints = 0; let fitMax = 0;\nconst rule = (name, r, value, test) => { if (!r) return; fitMax += r.points; if (value === null || value === undefined || value === '') { fitPoints += r.points / 2; fitFlags.push(`${name}_missing`); } else if (test(value)) fitPoints += r.points; };\nconst inList = (r) => (v) => (r.values || []).map((x) => String(x).toLowerCase()).includes(String(v).toLowerCase());\nconst inRange = (r) => (v) => Number(v) >= (r.min ?? -Infinity) && Number(v) <= (r.max ?? Infinity);\nrule('industry', ICP.industries, pr.industry, inList(ICP.industries || {}));\nrule('employees', ICP.employees, numOr(pr.numberofemployees), inRange(ICP.employees || {}));\nrule('country', ICP.countries, pr.country, inList(ICP.countries || {}));\nrule('revenue', ICP.revenue, numOr(pr.annualrevenue), inRange(ICP.revenue || {}));\nconst fit = fitMax ? Math.round((fitPoints / fitMax) * 100) : 50;\n// 5. account score + tier\nconst account = Math.round(IW * intent + FW * fit);\nconst tier = fit < NON_ICP && intent >= 40 ? 'non_icp' : (account >= HOT && intent >= HOT_INTENT && fit >= HOT_FIT) ? 'hot' : account >= WARM ? 'warm' : account >= MONITOR ? 'monitor' : 'cold';\nconst RANK = { cold: 0, non_icp: 0, monitor: 1, warm: 2, hot: 3 };\nconst prevTier = pr[P.tier] || null;\nconst prevScore = numOr(pr[P.account]);\nconst trend = prevScore === null ? 'new' : account - prevScore >= 8 ? 'rising' : prevScore - account >= 8 ? 'falling' : 'steady';\nconst topSignals = applied.map((s) => merged[s].top).filter(Boolean);\nconst reviewNeeded = ['hot', 'warm'].includes(tier) && RANK[tier] > (RANK[prevTier] ?? 0);\nlet history = []; try { history = JSON.parse(pr[P.history] || '[]'); if (!Array.isArray(history)) history = []; } catch (e) { history = []; }\nhistory = history.filter((h) => h.d !== today);\nhistory.push({ d: today, s: account, i: intent, f: fit, t: tier });\nhistory = history.slice(-HISTORY);\nconst props = { [P.intent]: String(intent), [P.fit]: String(fit), [P.account]: String(account), [P.tier]: tier, [P.trend]: trend, [P.sources]: String(active.length),\n  [P.scored]: today, [P.history]: JSON.stringify(history) };\nif (topSignals.length) props[P.top] = topSignals.join(' · ').slice(0, 500);\nif (reviewNeeded) { props[P.review] = 'true'; props[P.reason] = `Moved from ${prevTier || 'unscored'} to ${tier} (score ${account}, intent ${intent}, fit ${fit})${topSignals.length ? `: ${topSignals.join('; ')}` : ''}`.slice(0, 500); }\nconst u = rest.updates || {};\nif (applied.includes('bombora')) Object.assign(props, { [P.bomboraScore]: String(u.bombora.score), [P.bomboraDate]: u.bombora.date, [P.bomboraTopics]: u.bombora.topics.join('; ') });\nif (applied.includes('6sense')) Object.assign(props, { [P.sixScore]: String(u['6sense'].score), [P.sixDate]: u['6sense'].date, [P.sixStage]: u['6sense'].stage });\nif (applied.includes('g2')) Object.assign(props, { [P.g2Score]: String(u.g2.score), [P.g2Date]: u.g2.date, [P.g2Activity]: u.g2.activity.join('; '), [P.g2Competitor]: String(!!u.g2.competitor) });\nconst unchanged = !applied.length && prevScore === account && prevTier === tier && pr[P.scored] === today;\nif (unchanged) return plan({ action: 'unchanged', companyId: co.id, account, tier, holds });\nreturn plan({ action: 'update', write: true, companyId: co.id, holds, applied, intent, fit, account, tier, prevTier, prevScore, trend, reviewNeeded,\n  effective: eff, fitFlags, activeSources: active.map(([s]) => s) }, { companyWrite: { path: `/crm/v3/objects/companies/${co.id}`, body: { properties: props } } });\n"
+      },
+      "id": "29c878bf-3f60-5bf7-9b66-4da0c94a1829",
+      "name": "Compute Account Intent Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        3360,
+        220
+      ],
+      "notes": "Decay · composite intent · ICP fit · account score · tier · review flag."
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "d8211b50-0940-5a39-95f8-4ea9ba32c6a7",
+              "leftValue": "={{ $json.plan.write }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "45092249-1dab-5458-a753-82a4e5528962",
+      "name": "Has Company Update?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3600,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "c2a99c7c-2c3b-5474-8c91-ac5e01d18776",
+              "leftValue": "={{ !$json.run.sandboxMode && !$json.run.dryRun }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "91fb3469-a465-5261-b706-4af2f6c2f710",
+      "name": "Live HubSpot Writes?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        3840,
+        160
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Simulate Company Update (Dry Run)      Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nreturn { json: { ...$json, kind: 'account_simulated', result: { ok: true, simulated: true, companyId: $json.plan.companyId, properties: Object.keys($json.companyWrite.body.properties).length } } };\n"
+      },
+      "id": "a2bdbe6c-e9fc-558c-a25d-bda4b3e8c72d",
+      "name": "Simulate Company Update (Dry Run)",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4080,
+        60
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ ($env.HUBSPOT_API_BASE_URL || 'https://api.hubapi.com').replace(/\\/+$/, '') }}{{ $json.companyWrite.path }}",
+        "options": {
+          "response": {
+            "response": {
+              "fullResponse": true,
+              "neverError": true
+            }
+          },
+          "timeout": 30000,
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1100
+            }
+          }
+        },
+        "method": "PATCH",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Authorization",
+              "value": "=Bearer {{ $env.HUBSPOT_ACCESS_TOKEN }}"
+            },
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.companyWrite.body) }}"
+      },
+      "id": "9fc49f0e-3f84-53b9-b12d-d7a65306bfae",
+      "name": "Update Company Intent",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        4080,
+        260
+      ],
+      "onError": "continueRegularOutput",
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Record Score Sync                      Mode: Run Once for Each Item\n// ─────────────────────────────────────────────────────────────────────\nlet ctx; let result;\nif ($json.plan) { ctx = $json; result = $json.result || { ok: ['unchanged'].includes($json.plan.action), simulated: false, companyId: $json.plan.companyId || null }; }\nelse {\n  ctx = $('Live HubSpot Writes?').item.json;\n  const s = Number($json.statusCode || 0);\n  result = { ok: !$json.error && s >= 200 && s < 300, simulated: false, companyId: ctx.plan.companyId, httpStatus: s || null, hubspotCategory: s >= 300 ? (($json.body || {}).category || null) : null };\n}\nconst { companyWrite, sandboxFixtures, lookup, updates, ...rest } = ctx;\nreturn { json: { ...rest, kind: 'account_result', sourcesUpdated: Object.keys(updates || {}), result } };\n"
+      },
+      "id": "6d756a7d-9e8b-5800-b670-ffecb2c18b46",
+      "name": "Record Score Sync",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4320,
+        220
+      ]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Audit Logger                           Mode: Run Once for Each Item\n// One structured, redacted record per outcome: hashed domain ref, HubSpot\n// company id, sources, scores, tier and write result. No contacts, no\n// visitor locations, no raw provider payloads. Ring buffer (not in sandbox).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['INTENT_WEBHOOK_SECRET', 'INTENT_WEBHOOK_SECRET_BOMBORA', 'INTENT_WEBHOOK_SECRET_6SENSE', 'INTENT_WEBHOOK_SECRET_G2', 'BOMBORA_API_KEY', 'G2_API_TOKEN', 'SIXSENSE_API_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Basic\\s+[A-Za-z0-9+\\/]{8,}=*/gi, 'Basic [REDACTED]')\n    .replace(/Token\\s+token=[^\\s\"',]+/gi, 'Token token=[REDACTED]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bsk-[A-Za-z0-9_\\-]{16,}/g, '[REDACTED_OPENAI_KEY]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst j = $json;\nconst run = j.run || {};\nlet domainRef = null;\nif (j.domain) { try { domainRef = `acct-${require('crypto').createHash('sha256').update(env('DOMAIN_REF_SALT', '') + j.domain).digest('hex').slice(0, 12)}`; } catch (e) { domainRef = null; } }\nconst record = { record: j.kind, at: new Date().toISOString(), runId: run.runId || null, mode: run.mode || null, origin: j.origin || run.origin || null, source: j.source || null,\n  domainRef, reason: j.reason || null, httpStatus: j.httpStatus || null };\nif (j.stats) record.stats = j.stats;\nif (j.kind === 'intent_batch' || j.kind === 'rejected') record.signals = Array.isArray(j.signals) ? j.signals.length : undefined;\nif (j.plan) Object.assign(record, { companyId: j.plan.companyId || null, sourcesUpdated: j.sourcesUpdated || [],\n  plan: { action: j.plan.action, write: !!j.plan.write, intent: j.plan.intent ?? null, fit: j.plan.fit ?? null, account: j.plan.account ?? null, tier: j.plan.tier || null,\n    prevTier: j.plan.prevTier || null, trend: j.plan.trend || null, reviewNeeded: !!j.plan.reviewNeeded, activeSources: j.plan.activeSources || [], effective: j.plan.effective || null,\n    fitFlags: j.plan.fitFlags || [], holds: j.plan.holds || [], reason: j.plan.reason || null }, result: j.result || null });\nconst safe = redact(record);\nif (flag('AUDIT_LOG_TO_STDOUT', true)) { try { console.log(`[intent-scorer:audit] ${JSON.stringify(safe)}`); } catch (e) { /* best effort */ } }\nif (!run.sandboxMode) { const sd = $getWorkflowStaticData('global'); sd.intentScorerAudit = [...(sd.intentScorerAudit || []), safe].slice(-Math.min(2000, Math.max(50, num('AUDIT_RING_BUFFER_SIZE', 500)))); }\nreturn { json: safe };\n"
+      },
+      "id": "7a2a1f45-6cde-5484-8926-9155ddd4bf67",
+      "name": "Audit Logger",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        4560,
+        300
+      ],
+      "notes": "Hashed domain refs, scores, tiers · no contacts or raw provider payloads."
+    },
+    {
+      "parameters": {},
+      "id": "2b5256ff-ef66-56f9-af02-9dd27e2e07d9",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [
+        0,
+        860
+      ],
+      "notes": "Fires when this workflow is selected as its own Error Workflow."
+    },
+    {
+      "parameters": {
+        "jsCode": "// ─────────────────────────────────────────────────────────────────────\n// Node: Sanitized Error Handler              Mode: Run Once for All Items\n// Fed by the Error Trigger when this workflow is its own Error Workflow.\n// Drops stack traces and request options, redacts secrets, and emits a\n// safe alert record (and optionally a minimal Slack notice).\n// ─────────────────────────────────────────────────────────────────────\nconst env = (key, fallback = '') => {\n  try {\n    const value = $env[key];\n    return value === undefined || value === null || String(value).trim() === '' ? fallback : String(value).trim();\n  } catch (error) {\n    return fallback; // env access blocked -> safe defaults apply\n  }\n};\nconst flag = (key, fallback) => {\n  const v = env(key, '').toLowerCase();\n  if (['true', '1', 'yes', 'on'].includes(v)) return true;\n  if (['false', '0', 'no', 'off'].includes(v)) return false;\n  return fallback; // unrecognised values keep the safe default\n};\nconst num = (key, fallback) => {\n  const raw = env(key, '');\n  const n = Number(raw);\n  return raw !== '' && Number.isFinite(n) ? n : fallback;\n};\nconst csv = (key, fallback = '') => env(key, fallback).split(',').map((s) => s.trim()).filter(Boolean);\nconst KNOWN_SECRETS = ['INTENT_WEBHOOK_SECRET', 'INTENT_WEBHOOK_SECRET_BOMBORA', 'INTENT_WEBHOOK_SECRET_6SENSE', 'INTENT_WEBHOOK_SECRET_G2', 'BOMBORA_API_KEY', 'G2_API_TOKEN', 'SIXSENSE_API_KEY', 'HUBSPOT_ACCESS_TOKEN', 'SLACK_WEBHOOK_URL']\n  .map((k) => env(k, '')).filter((v) => v.length >= 8);\nconst SECRET_KEY = /(authorization|token|secret|password|passwd|api[-_]?key|cookie|signature|webhook[-_]?url)/i;\nconst redactString = (input) => {\n  let s = String(input ?? '');\n  for (const secret of KNOWN_SECRETS) s = s.split(secret).join('[REDACTED]');\n  return s\n    .replace(/\\beyJ[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{4,}/g, '[REDACTED_JWT]')\n    .replace(/Basic\\s+[A-Za-z0-9+\\/]{8,}=*/gi, 'Basic [REDACTED]')\n    .replace(/Token\\s+token=[^\\s\"',]+/gi, 'Token token=[REDACTED]')\n    .replace(/Bearer\\s+[A-Za-z0-9\\-._~+\\/]+=*/gi, 'Bearer [REDACTED]')\n    .replace(/\\bsk-[A-Za-z0-9_\\-]{16,}/g, '[REDACTED_OPENAI_KEY]')\n    .replace(/\\bpat-[a-z0-9]{2,6}-[A-Za-z0-9-]{8,}\\b/gi, '[REDACTED_HUBSPOT_TOKEN]')\n    .replace(/-----BEGIN [A-Z ]*PRIVATE KEY-----[\\s\\S]*?-----END [A-Z ]*PRIVATE KEY-----/g, '[REDACTED_PRIVATE_KEY]')\n    .replace(/https:\\/\\/hooks\\.slack\\.com\\/[^\\s\"']+/gi, '[REDACTED_SLACK_WEBHOOK]')\n    .replace(/([?&](?:api_key|apikey|key|token|secret|signature|sig)=)[^&\\s\"']+/gi, '$1[REDACTED]')\n    .replace(/\\b([A-Za-z0-9._%+-])[A-Za-z0-9._%+-]*@([A-Za-z0-9.-]+\\.[A-Za-z]{2,})\\b/g, '$1***@$2')\n    .slice(0, 1000);\n};\nconst redact = (value, depth = 0) => {\n  if (depth > 7) return '[TRUNCATED]';\n  if (value === null || value === undefined) return value ?? null;\n  if (typeof value === 'string') return redactString(value);\n  if (Array.isArray(value)) return value.slice(0, 60).map((v) => redact(v, depth + 1));\n  if (typeof value === 'object') {\n    const out = {};\n    for (const [k, v] of Object.entries(value)) out[k] = SECRET_KEY.test(k) ? '[REDACTED]' : redact(v, depth + 1);\n    return out;\n  }\n  return value;\n};\n\nconst SANDBOX_MODE = flag('SANDBOX_MODE', true);\nconst DRY_RUN = flag('DRY_RUN', true);\n\nreturn $input.all().map(({ json }) => {\n  const execution = json.execution || {};\n  const error = execution.error || (json.trigger && json.trigger.error) || {};\n  const alert = {\n    alertType: 'intent_scorer_execution_error',\n    at: new Date().toISOString(),\n    workflow: { id: json.workflow ? json.workflow.id : null, name: redactString(json.workflow ? json.workflow.name : '') },\n    execution: { id: execution.id || null, mode: execution.mode || null, retryOf: execution.retryOf || null },\n    lastNodeExecuted: execution.lastNodeExecuted || null,\n    errorName: redactString(error.name || 'Error'),\n    errorMessage: redactString(error.message || 'unknown error').slice(0, 300),\n    nextStep: 'Open the execution in n8n (restricted access) and check the node named in lastNodeExecuted.',\n  };\n  try { console.error(`[intent-scorer:error] ${JSON.stringify(alert)}`); } catch (e) { /* best effort */ }\n  const notify = !SANDBOX_MODE && !DRY_RUN && env('SLACK_WEBHOOK_URL', '') !== '' && flag('SLACK_NOTIFY_ON_MONITOR_ERROR', true);\n  return {\n    json: {\n      ...alert,\n      notify,\n      slackMessage: {\n        text: `Intent account scorer failed at ${alert.lastNodeExecuted || 'unknown node'}`,\n        blocks: [\n          { type: 'header', text: { type: 'plain_text', text: '⚠️ Intent account scorer failed', emoji: true } },\n          { type: 'section', text: { type: 'mrkdwn', text: `*Node:* ${alert.lastNodeExecuted || 'unknown'}\\n*Error:* ${alert.errorName}: ${alert.errorMessage}` } },\n          { type: 'context', elements: [{ type: 'mrkdwn', text: `Execution \\`${alert.execution.id || 'n/a'}\\` · accounts are rescored by the next weekly poll once this is fixed` }] },\n        ],\n      },\n    },\n  };\n});\n"
+      },
+      "id": "1119d2c4-56b1-5ca7-bfee-36bdc5f63d36",
+      "name": "Sanitized Error Handler",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        240,
+        860
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "loose",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "eff74a61-8316-59c7-aad5-07d1e170f687",
+              "leftValue": "={{ $json.notify }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "5b2245ee-8e19-5f43-8d9c-98cec59a7bdd",
+      "name": "Notify Execution Error?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        480,
+        860
+      ]
+    },
+    {
+      "parameters": {
+        "url": "={{ $env.SLACK_WEBHOOK_URL }}",
+        "options": {
+          "timeout": 10000
+        },
+        "method": "POST",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.slackMessage) }}"
+      },
+      "id": "232d4980-84a5-556d-b3e3-deb330445c6f",
+      "name": "Post Execution Error Notice",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [
+        720,
+        800
+      ],
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "content": "## n8n-multisource-intent-data-account-scorer\nBombora + 6sense + G2 intent → normalized source scores → decay + ICP fit → composite account intent score on HubSpot companies. DH Robin · dhRobin Systems.\n\n**Safe defaults:** `SANDBOX_MODE=true`, `DRY_RUN=true`. No provider or HubSpot calls until both are `false`.\n\n**Stage 1** Execute the webhook and the weekly poll with their pinned fictional data.\n**Stage 2** `SANDBOX_MODE=false`: real providers + HubSpot lookups, writes simulated.\n**Stage 3** `DRY_RUN=false`: scores and tiers go live.\n\nNo contacts are created or read. Every tier change is a flag for a person to review.",
+        "height": 330,
+        "width": 760,
+        "color": 4
+      },
+      "id": "b90839ab-7560-57e8-b3f3-0786faae5d2d",
+      "name": "Sticky: Start Here",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        -360
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Scoring\nintent = 0.6 × strongest source + 0.4 × weighted mean (+ corroboration) · account = 0.6 × intent + 0.4 × fit · decay half-life 14 days.",
+        "height": 110,
+        "width": 640,
+        "color": 3
+      },
+      "id": "c5797650-3781-5f14-b8cc-dee0ccd44f5c",
+      "name": "Sticky: Score",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        3080,
+        -40
+      ]
+    },
+    {
+      "parameters": {
+        "content": "### Sanitized error path\nNo stack traces, headers or bodies. API keys, tokens and webhook URLs are redacted.",
+        "height": 90,
+        "width": 600,
+        "color": 2
+      },
+      "id": "5e36f1b0-3cf0-535b-9c9b-78e37705ac4a",
+      "name": "Sticky: Errors",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -40,
+        740
+      ]
+    }
+  ],
+  "connections": {
+    "Intent Signal Webhook": {
+      "main": [
+        [
+          {
+            "node": "Verify & Unwrap Intent Batch",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Verify & Unwrap Intent Batch": {
+      "main": [
+        [
+          {
+            "node": "Intent Normalizer & Weighting Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Weekly Intent Poll": {
+      "main": [
+        [
+          {
+            "node": "Build Poll Window",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Poll Window": {
+      "main": [
+        [
+          {
+            "node": "Sandbox Poll?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox Poll?": {
+      "main": [
+        [
+          {
+            "node": "Load Poll Fixtures (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Poll Bombora?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Load Poll Fixtures (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Package Poll Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll Bombora?": {
+      "main": [
+        [
+          {
+            "node": "Fetch Bombora Surge",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Poll G2?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch Bombora Surge": {
+      "main": [
+        [
+          {
+            "node": "Poll G2?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Poll G2?": {
+      "main": [
+        [
+          {
+            "node": "Fetch G2 Buyer Intent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Find Companies to Rescore",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch G2 Buyer Intent": {
+      "main": [
+        [
+          {
+            "node": "Find Companies to Rescore",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Find Companies to Rescore": {
+      "main": [
+        [
+          {
+            "node": "Package Poll Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Package Poll Results": {
+      "main": [
+        [
+          {
+            "node": "Intent Normalizer & Weighting Engine",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Intent Normalizer & Weighting Engine": {
+      "main": [
+        [
+          {
+            "node": "Is Account?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Is Account?": {
+      "main": [
+        [
+          {
+            "node": "Build Company Lookup",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build Company Lookup": {
+      "main": [
+        [
+          {
+            "node": "Sandbox HubSpot?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sandbox HubSpot?": {
+      "main": [
+        [
+          {
+            "node": "Simulate Company Lookup (Sandbox)",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Search Company by Domain",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Company Lookup (Sandbox)": {
+      "main": [
+        [
+          {
+            "node": "Compute Account Intent Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search Company by Domain": {
+      "main": [
+        [
+          {
+            "node": "Compute Account Intent Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Compute Account Intent Score": {
+      "main": [
+        [
+          {
+            "node": "Has Company Update?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Has Company Update?": {
+      "main": [
+        [
+          {
+            "node": "Live HubSpot Writes?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Record Score Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Live HubSpot Writes?": {
+      "main": [
+        [
+          {
+            "node": "Update Company Intent",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Simulate Company Update (Dry Run)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Simulate Company Update (Dry Run)": {
+      "main": [
+        [
+          {
+            "node": "Record Score Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Update Company Intent": {
+      "main": [
+        [
+          {
+            "node": "Record Score Sync",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Record Score Sync": {
+      "main": [
+        [
+          {
+            "node": "Audit Logger",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Trigger": {
+      "main": [
+        [
+          {
+            "node": "Sanitized Error Handler",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Sanitized Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Notify Execution Error?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Execution Error?": {
+      "main": [
+        [
+          {
+            "node": "Post Execution Error Notice",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    }
+  },
+  "pinData": {
+    "Intent Signal Webhook": [
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=7dc0e1bee3de7496cb1249d45a558c899096146f747c42fd697a2f87b4d5505d",
+            "x-intent-timestamp": "1794812400"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "source": "bombora",
+            "sent_at": "2026-11-16T06:00:00Z",
+            "signals": [
+              {
+                "company_name": "Fictional",
+                "domain": "northwind-fixture.example",
+                "topic_id": "fx-35507",
+                "topic_name": "Revenue Operations",
+                "composite_score": 82,
+                "composite_score_delta": 12,
+                "week": "2026-11-09"
+              },
+              {
+                "company_name": "Fictional",
+                "domain": "northwind-fixture.example",
+                "topic_id": "fx-40362",
+                "topic_name": "Sales Forecasting",
+                "composite_score": 74,
+                "composite_score_delta": 5,
+                "week": "2026-11-09"
+              },
+              {
+                "company_name": "Fictional",
+                "domain": "northwind-fixture.example",
+                "topic_id": "fx-40483",
+                "topic_name": "Employee Benefits",
+                "composite_score": 88,
+                "composite_score_delta": 0,
+                "week": "2026-11-09"
+              },
+              {
+                "company_name": "Fictional",
+                "domain": "contoso-fixture.example",
+                "topic_id": "fx-35507",
+                "topic_name": "Revenue Operations",
+                "composite_score": 61,
+                "composite_score_delta": 0,
+                "week": "2026-11-09"
+              },
+              {
+                "company_name": "Fictional",
+                "domain": "contoso-fixture.example",
+                "topic_id": "fx-29595",
+                "topic_name": "CRM Software",
+                "composite_score": 55,
+                "composite_score_delta": 0,
+                "week": "2026-11-09"
+              },
+              {
+                "company_name": "Fictional",
+                "domain": "gmail.com",
+                "topic_id": "fx-35507",
+                "topic_name": "Revenue Operations",
+                "composite_score": 90,
+                "composite_score_delta": 0,
+                "week": "2026-11-09"
+              },
+              {
+                "company_name": "Fictional",
+                "domain": "www.harbor-fixture.example",
+                "topic_id": "fx-59887",
+                "topic_name": "Data Warehousing",
+                "composite_score": 70,
+                "composite_score_delta": 0,
+                "week": "2026-11-09"
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-scorer/signals",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT Northwind surge (RevOps 82 + breadth) · Contoso 61 · free-mail dropped · www. stripped",
+          "sandboxFixtures": {
+            "now": "2026-11-16T09:00:00Z",
+            "config": {
+              "topicWeights": {
+                "Revenue Operations": 1.0,
+                "Sales Forecasting": 0.9,
+                "CRM Software": 0.8,
+                "Data Warehousing": 0.5
+              }
+            },
+            "companies": [
+              {
+                "id": "9001",
+                "properties": {
+                  "name": "Northwind Fixture Traders",
+                  "domain": "northwind-fixture.example",
+                  "industry": "COMPUTER_SOFTWARE",
+                  "numberofemployees": "850",
+                  "country": "United States",
+                  "annualrevenue": "120000000",
+                  "intent_g2_score": "40",
+                  "intent_g2_date": "2026-11-01",
+                  "intent_account_score": "52",
+                  "intent_tier": "monitor",
+                  "intent_score_history": "[{\"d\":\"2026-10-26\",\"s\":44,\"i\":44,\"f\":80,\"t\":\"monitor\"},{\"d\":\"2026-11-02\",\"s\":52,\"i\":52,\"f\":80,\"t\":\"monitor\"}]"
+                }
+              },
+              {
+                "id": "9002",
+                "properties": {
+                  "name": "Contoso Fixture Ltd",
+                  "domain": "contoso-fixture.example",
+                  "industry": "FINANCIAL_SERVICES",
+                  "numberofemployees": "2400",
+                  "country": "United Kingdom",
+                  "annualrevenue": "600000000"
+                }
+              },
+              {
+                "id": "9003",
+                "properties": {
+                  "name": "Harbor Fixture Logistics",
+                  "domain": "www.harbor-fixture.example",
+                  "industry": "LOGISTICS_AND_SUPPLY_CHAIN",
+                  "numberofemployees": "150",
+                  "country": "Canada",
+                  "annualrevenue": null
+                }
+              },
+              {
+                "id": "9004",
+                "properties": {
+                  "name": "Globex Fixture Co",
+                  "domain": "globex-fixture.example",
+                  "industry": "RETAIL",
+                  "numberofemployees": "40",
+                  "country": "Brazil",
+                  "annualrevenue": "3000000"
+                }
+              },
+              {
+                "id": "9005",
+                "properties": {
+                  "name": "Umbrella Fixture Systems",
+                  "domain": "umbrella-fixture.example",
+                  "industry": "COMPUTER_SOFTWARE",
+                  "numberofemployees": "1200",
+                  "country": "Germany",
+                  "annualrevenue": "300000000",
+                  "intent_bombora_score": "75",
+                  "intent_bombora_date": "2026-10-12",
+                  "intent_score": "64",
+                  "intent_fit_score": "100",
+                  "intent_account_score": "78",
+                  "intent_tier": "hot",
+                  "intent_last_scored": "2026-10-19",
+                  "intent_score_history": "[{\"d\":\"2026-10-19\",\"s\":78,\"i\":78,\"f\":80,\"t\":\"hot\"}]"
+                }
+              }
+            ],
+            "poll": {
+              "bombora": [
+                {
+                  "company_name": "Fictional",
+                  "domain": "northwind-fixture.example",
+                  "topic_id": "fx-35507",
+                  "topic_name": "Revenue Operations",
+                  "composite_score": 80,
+                  "composite_score_delta": -2,
+                  "week": "2026-11-16"
+                }
+              ],
+              "g2": {
+                "data": [
+                  {
+                    "id": "fx-g2-1",
+                    "type": "buyer_intent",
+                    "attributes": {
+                      "company_domain": "northwind-fixture.example",
+                      "visit_type": "profile",
+                      "visits": 2,
+                      "visit_date": "2026-11-15",
+                      "product_name": "Lumen",
+                      "visitor_country": "dropped by the normalizer"
+                    }
+                  }
+                ]
+              },
+              "rescore": {
+                "results": [
+                  {
+                    "id": "9005",
+                    "properties": {
+                      "domain": "umbrella-fixture.example"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=2f5b40d5ea1c41e46338a167288b9259029dfaa286f996ae819389898f493bd5",
+            "x-intent-timestamp": "1794812400"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "source": "6sense",
+            "sent_at": "2026-11-16T06:05:00Z",
+            "signals": [
+              {
+                "domain": "northwind-fixture.example",
+                "intent_score": 78,
+                "buying_stage": "Decision",
+                "profile_fit": "Strong",
+                "keywords": [
+                  "revenue intelligence",
+                  "forecasting software"
+                ],
+                "updated_at": "2026-11-14T00:00:00Z"
+              },
+              {
+                "domain": "globex-fixture.example",
+                "intent_score": 85,
+                "buying_stage": "Purchase",
+                "profile_fit": "Weak",
+                "keywords": [],
+                "updated_at": "2026-11-15T00:00:00Z"
+              },
+              {
+                "domain": "initrode-fixture.example",
+                "intent_score": 70,
+                "buying_stage": "Consideration",
+                "profile_fit": "Moderate",
+                "keywords": [],
+                "updated_at": "2026-11-15T00:00:00Z"
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-scorer/signals",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT Northwind → hot (corroborated) · Globex non_icp · Initrode not in HubSpot"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=708b367de57714a280400c0146e513c0966c8f282a34dd740457f1adfad96087",
+            "x-intent-timestamp": "1794812400"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "source": "g2",
+            "sent_at": "2026-11-16T06:10:00Z",
+            "signals": [
+              {
+                "company_domain": "contoso-fixture.example",
+                "visit_type": "competitive/pricing",
+                "visits": 3,
+                "visit_date": "2026-11-13",
+                "product_name": "Lumen",
+                "visitor_country": "dropped by the normalizer"
+              },
+              {
+                "company_domain": "contoso-fixture.example",
+                "visit_type": "compare",
+                "visits": 2,
+                "visit_date": "2026-11-12",
+                "product_name": "Lumen",
+                "visitor_country": "dropped by the normalizer"
+              },
+              {
+                "company_domain": "harbor-fixture.example",
+                "visit_type": "category",
+                "visits": 1,
+                "visit_date": "2026-11-10",
+                "product_name": "Lumen",
+                "visitor_country": "dropped by the normalizer"
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-scorer/signals",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT Contoso competitor pricing research + Bombora surge → hot · Harbor monitor (fit data incomplete)"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=8b9951fe336765bcd776e0d7c19f451da870c9492cc944b469f34599c46f3da7",
+            "x-intent-timestamp": "1794812400"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "source": "g2",
+            "signals": [
+              {
+                "company_domain": "contoso-fixture.example",
+                "visit_type": "pricing",
+                "visits": 9,
+                "visit_date": "2026-11-15",
+                "product_name": "Lumen",
+                "visitor_country": "dropped by the normalizer"
+              }
+            ]
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-scorer/signals",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT rejected · signature_mismatch"
+        }
+      },
+      {
+        "json": {
+          "headers": {
+            "content-type": "application/json",
+            "x-intent-signature": "sha256=7b88cc88dfd0ab97754b586b6db5a61f0c3c878dd76031cd55b08ab538c42c57",
+            "x-intent-timestamp": "1794812400"
+          },
+          "params": {},
+          "query": {},
+          "body": {
+            "source": "zoominfo",
+            "signals": []
+          },
+          "webhookUrl": "https://YOUR_N8N_HOST/webhook/intent-scorer/signals",
+          "executionMode": "test",
+          "sandboxFixture": "EXPECT rejected · source_not_supported"
+        }
+      }
+    ],
+    "Weekly Intent Poll": [
+      {
+        "json": {
+          "timestamp": "2026-11-16T06:00:00.000+00:00",
+          "Readable date": "November 16th 2026, 6:00:00 am",
+          "Timezone": "UTC",
+          "sandboxFixtures": {
+            "now": "2026-11-16T09:00:00Z",
+            "config": {
+              "topicWeights": {
+                "Revenue Operations": 1.0,
+                "Sales Forecasting": 0.9,
+                "CRM Software": 0.8,
+                "Data Warehousing": 0.5
+              }
+            },
+            "companies": [
+              {
+                "id": "9001",
+                "properties": {
+                  "name": "Northwind Fixture Traders",
+                  "domain": "northwind-fixture.example",
+                  "industry": "COMPUTER_SOFTWARE",
+                  "numberofemployees": "850",
+                  "country": "United States",
+                  "annualrevenue": "120000000",
+                  "intent_g2_score": "40",
+                  "intent_g2_date": "2026-11-01",
+                  "intent_account_score": "52",
+                  "intent_tier": "monitor",
+                  "intent_score_history": "[{\"d\":\"2026-10-26\",\"s\":44,\"i\":44,\"f\":80,\"t\":\"monitor\"},{\"d\":\"2026-11-02\",\"s\":52,\"i\":52,\"f\":80,\"t\":\"monitor\"}]"
+                }
+              },
+              {
+                "id": "9002",
+                "properties": {
+                  "name": "Contoso Fixture Ltd",
+                  "domain": "contoso-fixture.example",
+                  "industry": "FINANCIAL_SERVICES",
+                  "numberofemployees": "2400",
+                  "country": "United Kingdom",
+                  "annualrevenue": "600000000"
+                }
+              },
+              {
+                "id": "9003",
+                "properties": {
+                  "name": "Harbor Fixture Logistics",
+                  "domain": "www.harbor-fixture.example",
+                  "industry": "LOGISTICS_AND_SUPPLY_CHAIN",
+                  "numberofemployees": "150",
+                  "country": "Canada",
+                  "annualrevenue": null
+                }
+              },
+              {
+                "id": "9004",
+                "properties": {
+                  "name": "Globex Fixture Co",
+                  "domain": "globex-fixture.example",
+                  "industry": "RETAIL",
+                  "numberofemployees": "40",
+                  "country": "Brazil",
+                  "annualrevenue": "3000000"
+                }
+              },
+              {
+                "id": "9005",
+                "properties": {
+                  "name": "Umbrella Fixture Systems",
+                  "domain": "umbrella-fixture.example",
+                  "industry": "COMPUTER_SOFTWARE",
+                  "numberofemployees": "1200",
+                  "country": "Germany",
+                  "annualrevenue": "300000000",
+                  "intent_bombora_score": "75",
+                  "intent_bombora_date": "2026-10-12",
+                  "intent_score": "64",
+                  "intent_fit_score": "100",
+                  "intent_account_score": "78",
+                  "intent_tier": "hot",
+                  "intent_last_scored": "2026-10-19",
+                  "intent_score_history": "[{\"d\":\"2026-10-19\",\"s\":78,\"i\":78,\"f\":80,\"t\":\"hot\"}]"
+                }
+              }
+            ],
+            "poll": {
+              "bombora": [
+                {
+                  "company_name": "Fictional",
+                  "domain": "northwind-fixture.example",
+                  "topic_id": "fx-35507",
+                  "topic_name": "Revenue Operations",
+                  "composite_score": 80,
+                  "composite_score_delta": -2,
+                  "week": "2026-11-16"
+                }
+              ],
+              "g2": {
+                "data": [
+                  {
+                    "id": "fx-g2-1",
+                    "type": "buyer_intent",
+                    "attributes": {
+                      "company_domain": "northwind-fixture.example",
+                      "visit_type": "profile",
+                      "visits": 2,
+                      "visit_date": "2026-11-15",
+                      "product_name": "Lumen",
+                      "visitor_country": "dropped by the normalizer"
+                    }
+                  }
+                ]
+              },
+              "rescore": {
+                "results": [
+                  {
+                    "id": "9005",
+                    "properties": {
+                      "domain": "umbrella-fixture.example"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    ]
+  },
+  "active": false,
+  "settings": {
+    "executionOrder": "v1",
+    "saveManualExecutions": true,
+    "saveDataErrorExecution": "all",
+    "saveDataSuccessExecution": "all",
+    "saveExecutionProgress": false,
+    "callerPolicy": "workflowsFromSameOwner",
+    "timezone": "UTC"
+  },
+  "tags": [],
+  "meta": {
+    "templateCredsSetupCompleted": false,
+    "author": "DH Robin, Revenue Infrastructure Architect · dhRobin Systems",
+    "license": "MIT"
+  }
+}
